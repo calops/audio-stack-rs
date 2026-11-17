@@ -78,9 +78,9 @@ pub enum EngineEvent {
         duration_secs: f64,
     },
     /// A confirmed local playhead discontinuity, not an ordinary position tick.
-    /// Explicit seeks and source refreshes report the actual landing point
-    /// after installation; same-track restarts/repeats report at the audible
-    /// boundary.
+    /// Explicit seeks, refreshes and restarts confirm the installed position,
+    /// including while paused. Natural repeats and A–B loops confirm when
+    /// their boundary reaches the device.
     #[serde(rename_all = "camelCase")]
     Seeked {
         /// Stable queue identity; never a source address.
