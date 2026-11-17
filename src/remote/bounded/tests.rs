@@ -4,7 +4,7 @@ use crate::queue::RemoteFile;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::num::NonZeroU64;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -28,6 +28,8 @@ enum Fault {
 struct Server {
     url: String,
     requests: Arc<Mutex<Vec<(u64, u64)>>>,
+    requested: mpsc::Receiver<(u64, u64)>,
+    fault_from: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
 }
@@ -51,7 +53,10 @@ impl Server {
         );
         let requests = Arc::new(Mutex::new(Vec::new()));
         let seen = requests.clone();
+        let (notify, requested) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
+        let fault_from = Arc::new(AtomicU64::new(fault_from));
+        let faults = fault_from.clone();
         let stopped = stop.clone();
         let body = Arc::new(body);
         let thread = thread::spawn(move || {
@@ -62,8 +67,10 @@ impl Server {
                         let body = body.clone();
                         let seen = seen.clone();
                         let stalled = stalled.clone();
+                        let notify = notify.clone();
+                        let fault_from = faults.clone();
                         handlers.push(thread::spawn(move || {
-                            serve(socket, &body, fault, fault_from, seen, stalled);
+                            serve(socket, &body, fault, fault_from, seen, notify, stalled);
                         }));
                     }
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -80,6 +87,8 @@ impl Server {
             url,
             requests,
             stop,
+            requested,
+            fault_from,
             thread: Some(thread),
         }
     }
@@ -96,8 +105,9 @@ fn serve(
     mut socket: TcpStream,
     body: &[u8],
     fault: Fault,
-    fault_from: u64,
+    fault_from: Arc<AtomicU64>,
     seen: Arc<Mutex<Vec<(u64, u64)>>>,
+    notify: mpsc::Sender<(u64, u64)>,
     stalled: Option<mpsc::Sender<bool>>,
 ) {
     socket
@@ -130,7 +140,8 @@ fn serve(
         return;
     };
     seen.lock().unwrap().push((start, requested_end));
-    let fault = if start >= fault_from {
+    let _ = notify.send((start, requested_end));
+    let fault = if start >= fault_from.load(Ordering::Relaxed) {
         fault
     } else {
         Fault::None
@@ -289,6 +300,113 @@ fn later_failures_reach_the_reader_instead_of_becoming_eof_or_retrying() {
         assert!(source.read(&mut first).is_err());
         assert_eq!(server.requests.lock().unwrap().len(), 2);
     }
+}
+
+#[test]
+fn a_late_short_mp3_range_is_a_decoder_error_not_track_completion() {
+    // Silent MPEG-1 Layer III frames, 128 kbps at 44.1 kHz.
+    let mut frame = vec![0; 417];
+    frame[..4].copy_from_slice(&[0xff, 0xfb, 0x90, 0x64]);
+    let server = Server::new(frame.repeat(1000), Fault::ShortBody, u64::MAX);
+    let source = source(&server, config(4096, None)).unwrap();
+    let mut hint = symphonia::core::formats::probe::Hint::new();
+    hint.with_extension("mp3");
+    let mut decoder = crate::decode::Decoder::open(Box::new(source), hint).unwrap();
+    server.fault_from.store(65_536, Ordering::Relaxed);
+    let mut samples = [0.0; 4096];
+    let mut decoded = 0;
+    let error = loop {
+        match decoder.read(&mut samples) {
+            Ok(0) => panic!("short HTTP response silently completed the track"),
+            Ok(count) => decoded += count,
+            Err(error) => break error,
+        }
+    };
+    assert!(decoded > 0, "the failure occurs after playback starts");
+    assert!(error.contains("short bounded range response"), "{error}");
+    assert!(!error.contains("secret"));
+    assert!(!decoder.is_exhausted());
+}
+
+#[test]
+fn cached_and_boundary_seeks_reuse_the_downloaded_lookahead() {
+    let server = Server::new((0..31).collect(), Fault::None, 0);
+    let mut source = source(&server, config(7, None)).unwrap();
+    assert_eq!(
+        server
+            .requested
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap(),
+        (0, 6)
+    );
+    assert_eq!(
+        server
+            .requested
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap(),
+        (7, 13)
+    );
+    source.seek(SeekFrom::Start(3)).unwrap();
+    let mut cached = [0; 4];
+    source.read_exact(&mut cached).unwrap();
+    assert_eq!(cached, [3, 4, 5, 6]);
+    source.seek(SeekFrom::Start(0)).unwrap();
+    source.seek(SeekFrom::Start(7)).unwrap();
+    let mut next = [0; 7];
+    source.read_exact(&mut next).unwrap();
+    assert_eq!(next, [7, 8, 9, 10, 11, 12, 13]);
+    assert_eq!(
+        server
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|&&(start, _)| start == 7)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn returning_from_an_eof_probe_restarts_lookahead_before_cached_reads() {
+    let server = Server::new((0..31).collect(), Fault::None, 0);
+    let mut source = source(&server, config(7, None)).unwrap();
+    assert_eq!(
+        server
+            .requested
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap(),
+        (0, 6)
+    );
+    assert_eq!(
+        server
+            .requested
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap(),
+        (7, 13)
+    );
+    source.seek(SeekFrom::End(0)).unwrap();
+    source.seek(SeekFrom::Start(0)).unwrap();
+    assert_eq!(
+        server
+            .requested
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap(),
+        (7, 13)
+    );
+    let mut bytes = [0; 14];
+    source.read_exact(&mut bytes).unwrap();
+    assert_eq!(bytes, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
+    assert_eq!(
+        server
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|&&(start, _)| start == 7)
+            .count(),
+        2
+    );
 }
 
 #[test]

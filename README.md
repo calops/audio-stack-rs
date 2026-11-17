@@ -157,9 +157,10 @@ bounded ranges, including the final short chunk; EOF sends no request.
 
 The current chunk and one asynchronous lookahead chunk stay in memory instead
 of downloading the whole file. Network waits happen on decoder/opener threads,
-never the audio callback. Seeking outside the current position or dropping a
-source cancels lookahead, including an in-flight response. Background next-track
-preloading and native overview decoding use the same transport.
+never the audio callback. Seeking outside the cached chunk or dropping a source
+cancels lookahead, including an in-flight response. Cached seeks retain useful
+lookahead; returning to the cached chunk restarts it after an EOF probe.
+Background next-track preloading and native overview decoding use the same transport.
 
 Metadata parsing is standalone — no engine required:
 

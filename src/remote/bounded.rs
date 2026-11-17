@@ -106,10 +106,8 @@ impl Fetcher {
             bytes.extend_from_slice(&part);
         }
         if bytes.len() as u64 != expected {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "short bounded range response",
-            ));
+            // Demuxers can interpret UnexpectedEof as a clean track ending.
+            return Err(invalid("short bounded range response"));
         }
         Ok(Chunk {
             start,
@@ -262,7 +260,14 @@ impl Seek for Source {
         }
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid remote seek"))?;
         if position != self.position {
-            self.cancel_prefetch();
+            let can_reuse = position >= self.chunk.start
+                && position <= self.chunk.end()
+                && position < self.length;
+            if !can_reuse {
+                self.cancel_prefetch();
+            } else if self.pending.is_none() {
+                self.prefetch();
+            }
             self.failure = None;
         }
         self.position = position;
