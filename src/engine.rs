@@ -267,6 +267,11 @@ enum OpenPurpose {
     Refresh,
 }
 
+enum PreloadState {
+    Opening(OpenTask),
+    Failed,
+}
+
 pub struct Engine {
     loudness_store: Arc<dyn Store>,
     commands: Receiver<EngineCommand>,
@@ -307,7 +312,7 @@ pub struct Engine {
     preloaded: Option<Decoder>,
     preloaded_entry: Option<QueueEntry>,
     /// Retained after failure so a pump never repeatedly resolves one source.
-    preloading: Option<(QueueEntry, OpenTask)>,
+    preloading: Option<(QueueEntry, PreloadState)>,
     /// Written by the ICY reader as the station announces tracks.
     now_playing: Option<NowPlaying>,
     reported_title: Option<String>,
@@ -1280,7 +1285,11 @@ impl Engine {
                 self.stop();
                 return;
             };
+            if !matches!(purpose, OpenPurpose::Refresh) {
+                self.current_duration = entry.duration_secs;
+            }
             if matches!(purpose, OpenPurpose::Refresh)
+                || position > 0.0
                 || matches!(entry.location, Location::Deferred(_))
             {
                 self.pending_current = Some(PendingCurrent {
@@ -1416,6 +1425,9 @@ impl Engine {
         self.decoder = None;
         self.pending_out.clear();
         self.chain.reset();
+        self.params.request_flush();
+        self.frames_written = 0;
+        self.params.reset_frames(0);
         self.boundaries.clear();
         self.boundaries.push_back(Boundary {
             frame: 0,
@@ -1424,7 +1436,6 @@ impl Engine {
             gain_db: self.current_gain_db,
             offset_secs: position,
         });
-        self.params.request_flush();
         self.playing = playing;
         if !playing {
             self.fade_then_pause();
@@ -1566,15 +1577,25 @@ impl Engine {
                 Err(message) => log::warn!("preload failed: {}", message),
             },
             Location::Remote(_) | Location::Deferred(_) => {
-                if let Some((_, task)) = self.preloading.as_ref() {
+                if let Some((_, state)) = self.preloading.as_mut() {
+                    let PreloadState::Opening(task) = state else {
+                        return;
+                    };
                     match task.try_recv() {
                         Ok(Ok(opened)) => {
                             self.preloaded = Some(opened.decoder);
                             self.preloaded_entry = Some(next);
                             self.preloading = None;
                         }
-                        Ok(Err(message)) => log::warn!("preload failed: {}", message),
-                        Err(_) => {}
+                        Ok(Err(message)) => {
+                            log::warn!("preload failed: {}", message);
+                            *state = PreloadState::Failed;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            log::warn!("preload failed: source opener disconnected");
+                            *state = PreloadState::Failed;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {}
                     }
                 } else {
                     let task = source::open_in_background(
@@ -1583,7 +1604,7 @@ impl Engine {
                         self.runtime.clone(),
                         0.0,
                     );
-                    self.preloading = Some((next, task));
+                    self.preloading = Some((next, PreloadState::Opening(task)));
                 }
             }
         }
@@ -1999,10 +2020,19 @@ impl Engine {
             return;
         };
         let preloaded = self.take_preloaded(&next);
-        let preloading = self.preloading.take().filter(|(entry, _)| {
-            entry.track_id == next.track_id && entry.location == next.location
-        });
+        let preloading = self
+            .preloading
+            .take()
+            .and_then(|(entry, state)| match state {
+                PreloadState::Opening(task)
+                    if entry.track_id == next.track_id && entry.location == next.location =>
+                {
+                    Some((entry, task))
+                }
+                _ => None,
+            });
         self.queue.advance();
+        self.current_duration = next.duration_secs;
         self.decoder = None;
         if let Some(decoder) = preloaded {
             self.current_duration = decoder.format().duration_secs.unwrap_or(next.duration_secs);
@@ -2661,30 +2691,39 @@ mod tests {
     }
 
     #[test]
-    fn refresh_worker_seeks_before_the_same_identity_decoder_is_installed() {
+    #[ignore = "requires an audio output device"]
+    fn refresh_completion_keeps_pause_position_identity_and_discards_partial_metering() {
         let (path, entry) = wav_track(1, "audio-stack-refresh-worker");
         let (mut engine, sink) = captured_engine();
+        engine.loudness_store = Arc::new(EagerStore);
+        engine.params.set_volume(0.0);
+        engine
+            .ensure_output()
+            .expect("an output device is available");
         engine.queue.load(vec![entry.clone()], 0);
         engine.mode = Mode::Local;
+        let decoder = Decoder::open_file(&path).expect("initial native decoder");
+        engine.current_duration = decoder.format().duration_secs.unwrap();
+        engine.install_decoder(decoder, entry.gain_db);
         engine.reported_index = Some(0);
-        engine.refresh_current(0.5, false);
-        let pending = engine.pending_current.take().expect("worker owns reopen");
-        let mut result = None;
-        until(|| {
-            if let Ok(opened) = pending.task.try_recv() {
-                result = Some(opened.expect("native wav reopen"));
-                true
-            } else {
-                false
-            }
+        assert!(
+            engine.measuring.is_some(),
+            "a full initial listen is being measured"
+        );
+
+        engine.handle(EngineCommand::RefreshCurrent {
+            position_seconds: 0.5,
+            playing: false,
         });
-        let opened = result.unwrap();
-        assert!((opened.position_seconds - 0.5).abs() < 0.01);
-        assert!((opened.decoder.position_secs() - 0.5).abs() < 0.01);
-        // Exercise installation separately from ensure_output, with the native
-        // decoder returned by the real worker and no synthetic audio device.
-        engine.install_decoder_at(opened.decoder, entry.gain_db, opened.position_seconds, true);
-        engine.finish_measuring(false);
+        until(|| {
+            engine.poll_current();
+            engine.pending_current.is_none()
+        });
+        let decoder = engine
+            .decoder
+            .as_ref()
+            .expect("refresh installed its decoder");
+        assert!((decoder.position_secs() - 0.5).abs() < 0.01);
         engine.emit_progress_now();
         assert!(!engine.playing);
         assert!((engine.position_secs() - 0.5).abs() < 0.01);
@@ -4302,5 +4341,167 @@ mod tests {
             "only {played} frames played — the station did not reach the device"
         );
         println!("radio played {played} frames");
+    }
+
+    #[test]
+    fn seeking_a_pending_remote_transition_seeks_the_native_decoder() {
+        let input = fixtures::ramp(1, 16_000);
+        let expected = f32::from(input[4_000]) / 32_768.0;
+        let address = crate::remote::test_server::serve(fixtures::wav_bytes(8_000, 1, &input));
+        let next = QueueEntry {
+            track_id: 2,
+            location: Location::Remote(crate::RemoteFile {
+                url: format!("{address}/track.wav"),
+                extension: Some("wav".to_owned()),
+                bounded_range: None,
+            }),
+            duration_secs: 2.0,
+            gain_db: 0.0,
+        };
+        let outgoing = QueueEntry {
+            track_id: 1,
+            location: std::path::PathBuf::from("finished.wav").into(),
+            duration_secs: 1.0,
+            gain_db: 0.0,
+        };
+        let mut engine = bare_engine();
+        engine.queue.load(vec![outgoing, next], 0);
+        engine.mode = Mode::Local;
+        engine.current_duration = 1.0;
+        engine.refresh_preload();
+        engine.advance_or_stop();
+        assert!(engine.pending_current.is_some());
+        assert!(engine.seek(0.5));
+        until(|| {
+            engine.poll_current();
+            engine.pending_current.is_none()
+        });
+        let decoder = engine
+            .decoder
+            .as_mut()
+            .expect("the positioned source opens");
+        assert!((decoder.position_secs() - 0.5).abs() < 0.01);
+        let mut samples = [0.0; 64];
+        assert!(decoder.read(&mut samples).unwrap() > 0);
+        assert!(
+            (samples[0] - expected).abs() < 0.001,
+            "audio follows the requested seek: {} instead of {expected}",
+            samples[0]
+        );
+        assert!((engine.position_secs() - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn relative_seeks_while_opening_use_the_pending_tracks_duration() {
+        let mut engine = bare_engine();
+        let (resolver, calls) = controlled_resolver();
+        engine.resolver = Some(resolver);
+        let mut entry = deferred_entry(1, "long-track");
+        entry.duration_secs = 100.0;
+        engine.queue.load(vec![entry], 0);
+        engine.mode = Mode::Local;
+        engine.current_duration = 10.0;
+        engine.start_current();
+        let first = next_resolve(&calls);
+        engine.seek_by(30.0, SeekDirection::Forward);
+        let second = next_resolve(&calls);
+        assert_cancelled(first.reply);
+        assert_eq!(engine.position_secs(), 30.0);
+        assert_eq!(engine.current_duration, 100.0);
+        engine.seek_by(5.0, SeekDirection::Backward);
+        let third = next_resolve(&calls);
+        assert_cancelled(second.reply);
+        assert_eq!(engine.position_secs(), 25.0);
+        engine.stop();
+        assert_cancelled(third.reply);
+    }
+
+    #[test]
+    fn a_failed_speculative_preload_is_reopened_when_the_track_is_needed() {
+        let (mut engine, sink) = captured_engine();
+        let (resolver, calls) = controlled_resolver();
+        engine.resolver = Some(resolver);
+        engine
+            .queue
+            .load(vec![deferred_entry(1, "one"), deferred_entry(2, "two")], 0);
+        engine.mode = Mode::Local;
+        engine.current_duration = 1.0;
+        engine.refresh_preload();
+        next_resolve(&calls)
+            .reply
+            .send(Err("temporary failure".to_owned()))
+            .unwrap();
+        until(|| {
+            engine.refresh_preload();
+            matches!(engine.preloading.as_ref(), Some((_, PreloadState::Failed)))
+        });
+        engine.advance_or_stop();
+        let foreground = next_resolve(&calls);
+        assert_eq!(foreground.id, "two");
+        let address = crate::remote::test_server::serve(fixtures::wav_bytes(
+            8_000,
+            1,
+            &fixtures::ramp(1, 16_000),
+        ));
+        foreground
+            .reply
+            .send(Ok(crate::RemoteFile {
+                url: format!("{address}/track.wav"),
+                extension: Some("wav".to_owned()),
+                bounded_range: None,
+            }))
+            .unwrap();
+        until(|| {
+            engine.poll_current();
+            engine.pending_current.is_none()
+        });
+        let mut audio = [0.0; 64];
+        assert!(
+            engine
+                .decoder
+                .as_mut()
+                .expect("foreground open recovered")
+                .read(&mut audio)
+                .unwrap()
+                > 0
+        );
+        assert_eq!(engine.queue.index(), 1);
+        assert!(!sink.0.lock().unwrap().iter().any(|event| {
+            matches!(event, EngineEvent::Error { message } if message.contains("disconnected"))
+        }));
+    }
+
+    #[test]
+    #[ignore = "requires an audio output device"]
+    fn a_failed_refresh_keeps_the_requested_position_with_an_active_output_clock() {
+        let (mut engine, _) = captured_engine();
+        engine.params.set_volume(0.0);
+        engine
+            .ensure_output()
+            .expect("an output device is available");
+        let (resolver, calls) = controlled_resolver();
+        engine.resolver = Some(resolver);
+        engine.queue.load(vec![deferred_entry(1, "one")], 0);
+        engine.mode = Mode::Local;
+        engine.reported_index = Some(0);
+        let rate = engine.device_rate();
+        assert!(rate > 0);
+        engine.params.reset_frames(u64::from(rate));
+        engine.frames_written = u64::from(rate);
+        engine.handle(EngineCommand::RefreshCurrent {
+            position_seconds: 0.5,
+            playing: false,
+        });
+        next_resolve(&calls)
+            .reply
+            .send(Err("source unavailable".to_owned()))
+            .unwrap();
+        until(|| {
+            engine.poll_current();
+            engine.pending_current.is_none()
+        });
+        assert!(!engine.playing);
+        assert_eq!(engine.position_secs(), 0.5);
+        assert_eq!(engine.queue.index(), 0);
     }
 }
