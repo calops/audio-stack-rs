@@ -439,21 +439,34 @@ fn native_decoder_and_background_preload_use_bounded_requests() {
         extension: Some("wav".into()),
         bounded_range: Some(config(4096, Some(bytes.len() as u64))),
     };
-    let receiver = crate::remote::open_in_background(remote, runtime().handle().clone());
-    let mut decoder = receiver
-        .recv_timeout(Duration::from_secs(5))
-        .unwrap()
-        .unwrap();
+    let task = crate::source::open_in_background(
+        crate::queue::Location::Remote(remote),
+        None,
+        runtime().handle().clone(),
+        3.0,
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut opened = loop {
+        match task.try_recv() {
+            Ok(result) => break result.unwrap(),
+            Err(mpsc::TryRecvError::Empty) => {
+                assert!(std::time::Instant::now() < deadline, "the opener answers");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) => panic!("the opener disconnected: {error}"),
+        }
+    };
+    assert!((opened.position_seconds - 3.0).abs() < 0.001);
+    let decoder = &mut opened.decoder;
     let duration = decoder.format().duration_secs.unwrap();
     assert!((duration - 4.0).abs() < 0.01);
     let mut audio = vec![0.0; 256];
-    decoder.seek(3.0).unwrap();
     assert!(decoder.read(&mut audio).unwrap() > 0);
     assert!(audio[0] > 0.6);
     decoder.seek(0.5).unwrap();
     assert!(decoder.read(&mut audio).unwrap() > 0);
     assert!(audio[0] < 0.3);
-    drop(decoder);
+    drop(opened);
     assert!(server
         .requests
         .lock()

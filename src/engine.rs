@@ -24,8 +24,8 @@ use super::nowplaying::Update;
 use super::output::{self, Output};
 use super::params::Params;
 use super::queue::{Location, Queue, QueueEntry};
-use super::remote;
 use super::resample::Resampler;
+use super::source::{self, OpenTask, SourceResolver};
 use super::stream::{NowPlaying, RadioStream};
 use crate::EventSink;
 
@@ -52,6 +52,11 @@ pub enum EngineCommand {
     LoadQueue {
         entries: Vec<QueueEntry>,
         index: usize,
+    },
+    SetSourceResolver(Arc<dyn SourceResolver>),
+    RefreshCurrent {
+        position_seconds: f64,
+        playing: bool,
     },
     /// Plays an already-connected station. The HTTP round trip happens in the
     /// command layer on Tauri's async runtime, so the engine thread only ever
@@ -244,6 +249,24 @@ fn relative_seek_target(
     })
 }
 
+/// The cursor and source captured for an asynchronous open. Dropping the task
+/// cancels work; checking the identity also protects against a moved cursor.
+struct PendingCurrent {
+    entry: QueueEntry,
+    index: usize,
+    task: OpenTask,
+    position_seconds: f64,
+    attempts_left: usize,
+    purpose: OpenPurpose,
+}
+
+#[derive(Clone, Copy)]
+enum OpenPurpose {
+    Start,
+    Advance,
+    Refresh,
+}
+
 pub struct Engine {
     loudness_store: Arc<dyn Store>,
     commands: Receiver<EngineCommand>,
@@ -254,6 +277,8 @@ pub struct Engine {
     runtime: tokio::runtime::Handle,
 
     queue: Queue,
+    resolver: Option<Arc<dyn SourceResolver>>,
+    pending_current: Option<PendingCurrent>,
     mode: Mode,
     playing: bool,
     station_id: Option<String>,
@@ -280,10 +305,9 @@ pub struct Engine {
     decoder: Option<Decoder>,
     /// Opened early so a gapless transition costs no probe or allocation.
     preloaded: Option<Decoder>,
-    /// A remote next track being opened off the engine thread, by its track
-    /// id. Kept after a failed open (its channel then reads disconnected) so
-    /// the same track is not retried on every pump.
-    preloading: Option<(i64, std::sync::mpsc::Receiver<Result<Decoder, String>>)>,
+    preloaded_entry: Option<QueueEntry>,
+    /// Retained after failure so a pump never repeatedly resolves one source.
+    preloading: Option<(QueueEntry, OpenTask)>,
     /// Written by the ICY reader as the station announces tracks.
     now_playing: Option<NowPlaying>,
     reported_title: Option<String>,
@@ -361,6 +385,8 @@ impl Engine {
             sink,
             runtime,
             queue: Queue::new(),
+            resolver: None,
+            pending_current: None,
             mode: Mode::Idle,
             playing: false,
             station_id: None,
@@ -374,6 +400,7 @@ impl Engine {
             pending_pause: false,
             decoder: None,
             preloaded: None,
+            preloaded_entry: None,
             preloading: None,
             now_playing: None,
             reported_title: None,
@@ -417,6 +444,7 @@ impl Engine {
             }
 
             self.service_pending_pause();
+            worked |= self.poll_current();
             worked |= self.pump();
             self.emit_progress();
             self.push_visual_frame();
@@ -433,8 +461,28 @@ impl Engine {
 
     fn handle(&mut self, command: EngineCommand) {
         match command {
+            EngineCommand::SetSourceResolver(resolver) => {
+                self.resolver = Some(resolver);
+                self.cancel_transition();
+                self.clear_preload();
+                if let Some(pending) = self.pending_current.take() {
+                    self.open_current(
+                        pending.attempts_left,
+                        pending.purpose,
+                        pending.position_seconds,
+                    );
+                }
+            }
+            EngineCommand::RefreshCurrent {
+                position_seconds,
+                playing,
+            } => {
+                self.refresh_current(position_seconds, playing);
+            }
             EngineCommand::LoadQueue { entries, index } => {
                 self.finish_measuring(false);
+                self.pending_current = None;
+                self.clear_preload();
                 // The queue is being replaced wholesale, so a transition's
                 // captured cursor position would point nowhere sensible —
                 // drop it rather than try to restore it.
@@ -474,6 +522,8 @@ impl Engine {
                 // Crossfading is a local-queue concept; switching to radio
                 // abandons whatever was fading in, same as LoadQueue.
                 self.transition = None;
+                self.pending_current = None;
+                self.clear_preload();
                 self.has_provider = has_provider;
                 self.reconnect_attempt = 0;
                 self.station_url = Some(url);
@@ -527,11 +577,15 @@ impl Engine {
             } => self.set_loop(start_secs, end_secs, repeats),
             EngineCommand::ClearLoop => self.clear_loop(),
             EngineCommand::SetShuffle(enabled) => {
+                self.cancel_transition();
+                self.clear_preload();
                 self.queue.set_shuffle(enabled);
                 self.refresh_preload();
                 self.emit_state();
             }
             EngineCommand::SetRepeat(enabled) => {
+                self.cancel_transition();
+                self.clear_preload();
                 self.queue.set_repeat(enabled);
                 self.refresh_preload();
                 self.emit_state();
@@ -719,7 +773,10 @@ impl Engine {
                 }
             }
             EngineCommand::Describe => self.describe(),
-            EngineCommand::Shutdown => {}
+            EngineCommand::Shutdown => {
+                self.pending_current = None;
+                self.clear_preload();
+            }
         }
     }
 
@@ -915,7 +972,11 @@ impl Engine {
         if self.mode == Mode::Idle || self.playing == playing {
             return;
         }
-        if playing && self.mode == Mode::Local && self.decoder.is_none() {
+        if playing
+            && self.mode == Mode::Local
+            && self.decoder.is_none()
+            && self.pending_current.is_none()
+        {
             // The queue played out earlier: the decoder is gone but the mode
             // was kept so the UI still shows the last track. Play means play
             // that track again — flipping the flag alone would report
@@ -942,6 +1003,7 @@ impl Engine {
 
     fn stop(&mut self) {
         self.finish_measuring(false);
+        self.pending_current = None;
         // Going idle; no cursor to preserve for a cancelled fade.
         self.transition = None;
         self.playing = false;
@@ -954,6 +1016,7 @@ impl Engine {
         self.station_epoch.fetch_add(1, Ordering::Relaxed);
         self.decoder = None;
         self.preloaded = None;
+        self.preloaded_entry = None;
         self.preloading = None;
         self.pending_out.clear();
         self.chain.reset();
@@ -993,6 +1056,16 @@ impl Engine {
         // outgoing one, if a crossfade happens to be running — so any fade
         // in progress is cancelled first (restoring the cursor to it).
         self.cancel_transition();
+        if let Some(pending) = self.pending_current.take() {
+            if !secs.is_finite() || secs < 0.0 {
+                self.pending_current = Some(pending);
+                return false;
+            }
+            self.finish_measuring(false);
+            self.open_current(pending.attempts_left, pending.purpose, secs);
+            self.emit_progress_now();
+            return true;
+        }
         let Some(decoder) = self.decoder.as_mut() else {
             return false;
         };
@@ -1044,7 +1117,7 @@ impl Engine {
     /// which is the track `seek` acts on once it cancels the fade — so the
     /// origin and the target agree.
     fn seek_by(&mut self, secs: f64, direction: SeekDirection) {
-        if self.mode != Mode::Local || self.decoder.is_none() {
+        if self.mode != Mode::Local || (self.decoder.is_none() && self.pending_current.is_none()) {
             return;
         }
         let Some(target) =
@@ -1187,31 +1260,48 @@ impl Engine {
     // ── track lifecycle ─────────────────────────────────────────────────
 
     fn start_current(&mut self) {
-        if let Err(message) = self.ensure_output() {
-            self.emit(EngineEvent::Error { message });
-            return;
-        }
+        self.pending_current = None;
+        self.clear_preload();
+        self.pending_pause = false;
+        self.finish_measuring(false);
+        self.decoder = None;
+        self.pending_out.clear();
+        self.chain.reset();
+        self.boundaries.clear();
+        self.params.request_flush();
+        self.playing = true;
+        self.open_current(self.queue.len(), OpenPurpose::Start, 0.0);
+    }
 
-        // A missing or corrupt file should not strand the queue — but with
-        // repeat on the cursor wraps forever, so each entry is tried at most
-        // once and then playback stops. (This used to recurse, which on a
-        // queue of unopenable files — an unplugged drive, say — overflowed
-        // the engine thread's stack and aborted the whole process.)
-        let mut attempts = self.queue.len();
+    /// Carries the one-pass failure bound across asynchronous opens as well.
+    fn open_current(&mut self, mut attempts: usize, purpose: OpenPurpose, position: f64) {
         loop {
             let Some(entry) = self.queue.current().cloned() else {
                 self.stop();
                 return;
             };
+            if matches!(purpose, OpenPurpose::Refresh)
+                || matches!(entry.location, Location::Deferred(_))
+            {
+                self.pending_current = Some(PendingCurrent {
+                    task: source::open_in_background(
+                        entry.location.clone(),
+                        self.resolver.clone(),
+                        self.runtime.clone(),
+                        position,
+                    ),
+                    entry,
+                    index: self.queue.index(),
+                    position_seconds: position,
+                    attempts_left: attempts,
+                    purpose,
+                });
+                self.emit_state();
+                return;
+            }
             match self.open_entry(&entry) {
                 Ok(decoder) => {
-                    self.current_duration = decoder
-                        .format()
-                        .duration_secs
-                        .unwrap_or(entry.duration_secs);
-                    self.install_decoder(decoder, entry.gain_db);
-                    self.mode = Mode::Local;
-                    self.begin_playback();
+                    self.accept_current(decoder, entry, purpose, position);
                     return;
                 }
                 Err(message) => {
@@ -1224,6 +1314,123 @@ impl Engine {
                 }
             }
         }
+    }
+
+    fn poll_current(&mut self) -> bool {
+        let Some(pending) = self.pending_current.as_ref() else {
+            return false;
+        };
+        if self.mode != Mode::Local
+            || self.queue.index() != pending.index
+            || !self.queue.current().is_some_and(|entry| {
+                entry.track_id == pending.entry.track_id && entry.location == pending.entry.location
+            })
+        {
+            self.pending_current = None;
+            return true;
+        }
+        let result = match pending.task.try_recv() {
+            Ok(result) => result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err("source opener disconnected".to_owned())
+            }
+        };
+        let pending = self.pending_current.take().expect("pending open");
+        match result {
+            Ok(opened) => self.accept_current(
+                opened.decoder,
+                pending.entry,
+                pending.purpose,
+                opened.position_seconds,
+            ),
+            Err(message) => {
+                self.emit(EngineEvent::Error { message });
+                if matches!(pending.purpose, OpenPurpose::Refresh) {
+                    self.playing = false;
+                    self.fade_then_pause();
+                    self.emit_state();
+                } else {
+                    let attempts = pending.attempts_left.saturating_sub(1);
+                    if attempts == 0 || self.queue.advance().is_none() {
+                        self.stop();
+                    } else {
+                        self.open_current(attempts, pending.purpose, 0.0);
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    fn accept_current(
+        &mut self,
+        decoder: Decoder,
+        entry: QueueEntry,
+        purpose: OpenPurpose,
+        position: f64,
+    ) {
+        // Natural handovers already own output. Initial opens create it only
+        // after a decoder is ready.
+        if !matches!(purpose, OpenPurpose::Advance) {
+            if let Err(message) = self.ensure_output() {
+                self.emit(EngineEvent::Error { message });
+                self.playing = false;
+                self.emit_state();
+                return;
+            }
+        }
+        self.current_duration = decoder
+            .format()
+            .duration_secs
+            .unwrap_or(entry.duration_secs);
+        if matches!(purpose, OpenPurpose::Advance) && self.gapless && position == 0.0 {
+            self.install_joined_decoder(decoder, entry.gain_db);
+        } else {
+            self.install_decoder_at(
+                decoder,
+                entry.gain_db,
+                position,
+                matches!(purpose, OpenPurpose::Refresh),
+            );
+        }
+        if matches!(purpose, OpenPurpose::Refresh) || position > 0.0 {
+            self.finish_measuring(false);
+        }
+        if self.playing {
+            self.begin_playback();
+        } else {
+            self.fade_then_pause();
+            self.emit_state();
+        }
+    }
+
+    fn refresh_current(&mut self, position: f64, playing: bool) {
+        if self.mode != Mode::Local || !position.is_finite() || position < 0.0 {
+            return;
+        }
+        self.cancel_transition();
+        self.pending_current = None;
+        self.clear_preload();
+        self.finish_measuring(false);
+        self.decoder = None;
+        self.pending_out.clear();
+        self.chain.reset();
+        self.boundaries.clear();
+        self.boundaries.push_back(Boundary {
+            frame: 0,
+            index: self.queue.index(),
+            duration_secs: self.current_duration,
+            gain_db: self.current_gain_db,
+            offset_secs: position,
+        });
+        self.params.request_flush();
+        self.playing = playing;
+        if !playing {
+            self.fade_then_pause();
+        }
+        self.open_current(1, OpenPurpose::Refresh, position);
+        self.emit_progress_now();
     }
 
     /// Returns whether the station actually started playing, so a reconnect
@@ -1259,6 +1466,16 @@ impl Engine {
     /// Swaps in a freshly opened decoder and resets everything derived from
     /// the old one.
     fn install_decoder(&mut self, decoder: Decoder, gain_db: f64) {
+        self.install_decoder_at(decoder, gain_db, 0.0, false);
+    }
+
+    fn install_decoder_at(
+        &mut self,
+        decoder: Decoder,
+        gain_db: f64,
+        position: f64,
+        preserve_identity: bool,
+    ) {
         // Defensive: every caller already clears this on its own path, but
         // a decoder swap and a crossfade cannot coexist.
         self.transition = None;
@@ -1275,6 +1492,7 @@ impl Engine {
         }
         self.decoder = Some(decoder);
         self.preloaded = None;
+        self.preloaded_entry = None;
         self.preloading = None;
 
         self.params.request_flush();
@@ -1282,13 +1500,15 @@ impl Engine {
         self.boundaries.clear();
         self.frames_written = 0;
         self.params.reset_frames(0);
-        self.reported_index = None;
+        if !preserve_identity {
+            self.reported_index = None;
+        }
         self.boundaries.push_back(Boundary {
             frame: 0,
             index: self.queue.index(),
             duration_secs: self.current_duration,
             gain_db: self.current_gain_db,
-            offset_secs: 0.0,
+            offset_secs: position,
         });
 
         self.emit(EngineEvent::Format {
@@ -1314,16 +1534,24 @@ impl Engine {
 
     /// Opens the next track early so a gapless join costs no probe.
     fn refresh_preload(&mut self) {
-        if self.mode != Mode::Local {
-            self.preloaded = None;
+        if self.mode != Mode::Local || self.pending_current.is_some() {
+            self.clear_preload();
             return;
         }
         let Some(next) = self.queue.peek_next().cloned() else {
-            self.preloaded = None;
+            self.clear_preload();
             return;
         };
-        // Source time left, over the chain's time ratio: what matters here is
-        // wall-clock time until the decoder is needed.
+        if self
+            .preloaded_entry
+            .as_ref()
+            .is_some_and(|entry| entry.track_id != next.track_id || entry.location != next.location)
+            || self.preloading.as_ref().is_some_and(|(entry, _)| {
+                entry.track_id != next.track_id || entry.location != next.location
+            })
+        {
+            self.clear_preload();
+        }
         let remaining =
             (self.current_duration - self.position_secs()) / self.chain.time_ratio().max(0.01);
         if self.preloaded.is_some() || remaining > PRELOAD_SECS {
@@ -1331,41 +1559,59 @@ impl Engine {
         }
         match &next.location {
             Location::File(path) => match Decoder::open_file(path) {
-                Ok(decoder) => self.preloaded = Some(decoder),
-                // Not fatal: the transition just falls back to opening late.
+                Ok(decoder) => {
+                    self.preloaded = Some(decoder);
+                    self.preloaded_entry = Some(next);
+                }
                 Err(message) => log::warn!("preload failed: {}", message),
             },
-            // A connect can take a while, and the engine thread is what keeps
-            // the ring fed: the next remote track opens on a thread of its
-            // own and is collected here once it is ready.
-            Location::Remote(remote_file) => match &self.preloading {
-                Some((track_id, receiver)) if *track_id == next.track_id => {
-                    match receiver.try_recv() {
-                        Ok(Ok(decoder)) => {
-                            self.preloaded = Some(decoder);
+            Location::Remote(_) | Location::Deferred(_) => {
+                if let Some((_, task)) = self.preloading.as_ref() {
+                    match task.try_recv() {
+                        Ok(Ok(opened)) => {
+                            self.preloaded = Some(opened.decoder);
+                            self.preloaded_entry = Some(next);
                             self.preloading = None;
                         }
                         Ok(Err(message)) => log::warn!("preload failed: {}", message),
                         Err(_) => {}
                     }
+                } else {
+                    let task = source::open_in_background(
+                        next.location.clone(),
+                        self.resolver.clone(),
+                        self.runtime.clone(),
+                        0.0,
+                    );
+                    self.preloading = Some((next, task));
                 }
-                _ => {
-                    self.preloading = Some((
-                        next.track_id,
-                        remote::open_in_background(remote_file.clone(), self.runtime.clone()),
-                    ));
-                }
-            },
+            }
+        }
+    }
+
+    fn clear_preload(&mut self) {
+        self.preloaded = None;
+        self.preloaded_entry = None;
+        self.preloading = None;
+    }
+
+    fn take_preloaded(&mut self, entry: &QueueEntry) -> Option<Decoder> {
+        let matches = self.preloaded_entry.as_ref().is_some_and(|loaded| {
+            loaded.track_id == entry.track_id && loaded.location == entry.location
+        });
+        self.preloaded_entry = None;
+        let decoder = self.preloaded.take();
+        if matches {
+            decoder
+        } else {
+            None
         }
     }
 
     /// Opens a queued track where it lives. A remote one waits for the
     /// server, which is only done here where a decoder is needed now.
     fn open_entry(&self, entry: &QueueEntry) -> Result<Decoder, String> {
-        match &entry.location {
-            Location::File(path) => Decoder::open_file(path),
-            Location::Remote(remote_file) => remote::open_blocking(remote_file, &self.runtime),
-        }
+        source::open_blocking(&entry.location, self.resolver.clone(), &self.runtime)
     }
 
     // ── the pump ────────────────────────────────────────────────────────
@@ -1617,19 +1863,23 @@ impl Engine {
             return false;
         }
 
-        self.preloading = None;
-        let decoder = match self.preloaded.take() {
+        self.refresh_preload();
+        let decoder = match self.take_preloaded(&next) {
             Some(decoder) => decoder,
+            None if matches!(next.location, Location::Remote(_) | Location::Deferred(_)) => {
+                // Never stall the ring on resolution, HTTP, or probing. If
+                // the worker misses this window the natural join will wait.
+                return false;
+            }
             None => match self.open_entry(&next) {
                 Ok(decoder) => decoder,
                 Err(message) => {
-                    // Not fatal: the join just falls back to whatever
-                    // `advance_or_stop` does once the outgoing track ends.
                     log::warn!("crossfade preload failed: {}", message);
                     return false;
                 }
             },
         };
+        self.preloading = None;
 
         let format = decoder.format().clone();
         let device_rate = self.device_rate();
@@ -1741,89 +1991,63 @@ impl Engine {
             return;
         }
 
-        // Same retry bound as `start_current`: with repeat on, `peek_next`
-        // never runs dry, so a queue where nothing opens must stop after one
-        // pass rather than recurse until the stack runs out.
-        let mut attempts = self.queue.len();
-        let (next, decoder) = loop {
-            let Some(next) = self.queue.peek_next().cloned() else {
-                // The queue ran its course. The mode stays Local so the UI
-                // keeps showing the finished track; `set_playing` knows how
-                // to start it again.
-                self.decoder = None;
-                self.playing = false;
-                self.emit_state();
-                return;
-            };
-            self.queue.advance();
-
-            self.preloading = None;
-            let decoder = match self.preloaded.take() {
-                Some(decoder) => Some(decoder),
-                None => match self.open_entry(&next) {
-                    Ok(decoder) => Some(decoder),
-                    Err(message) => {
-                        self.emit(EngineEvent::Error { message });
-                        None
-                    }
-                },
-            };
-
-            if let Some(decoder) = decoder {
-                break (next, decoder);
-            }
-            attempts = attempts.saturating_sub(1);
-            if attempts == 0 {
-                self.stop();
-                return;
-            }
+        let Some(next) = self.queue.peek_next().cloned() else {
+            self.decoder = None;
+            self.clear_preload();
+            self.playing = false;
+            self.emit_state();
+            return;
         };
-
-        self.current_duration = decoder.format().duration_secs.unwrap_or(next.duration_secs);
-
-        if self.gapless {
-            // Deliberately not applied here: the outgoing track is still in
-            // the ring. The boundary below carries it, and it lands when
-            // the join actually reaches the device.
-            let format = decoder.format().clone();
-            self.retune_resampler_for_join(format.sample_rate);
-            self.decoder = Some(decoder);
-            self.preloaded = None;
-            // The incoming track deserves a meter too. `install_decoder` is
-            // bypassed on this path to keep the ring intact, and without
-            // this call only the first track of a queue would ever be
-            // measured — every gapless-advanced track would keep gain 0
-            // forever.
-            self.start_measuring(&format);
-            self.clear_loop();
-
-            // No flush: whatever is still in the ring belongs to the
-            // previous track and must be heard. The boundary tells us when
-            // the new track actually starts coming out of the speakers.
-            // Anything the retune drained into `pending_out` is still the
-            // outgoing track, so the boundary sits past it.
-            let pending_frames = self.pending_out.len() as u64
-                / self.device_channels().max(1) as u64
-                + self.chain.pending_output_frames();
-            self.boundaries.push_back(Boundary {
-                frame: self.frames_written + pending_frames,
+        let preloaded = self.take_preloaded(&next);
+        let preloading = self.preloading.take().filter(|(entry, _)| {
+            entry.track_id == next.track_id && entry.location == next.location
+        });
+        self.queue.advance();
+        self.decoder = None;
+        if let Some(decoder) = preloaded {
+            self.current_duration = decoder.format().duration_secs.unwrap_or(next.duration_secs);
+            if self.gapless {
+                self.install_joined_decoder(decoder, next.gain_db);
+            } else {
+                self.install_decoder(decoder, next.gain_db);
+            }
+            self.refresh_preload();
+        } else if let Some((entry, task)) = preloading {
+            self.pending_current = Some(PendingCurrent {
+                entry,
                 index: self.queue.index(),
-                duration_secs: self.current_duration,
-                gain_db: next.gain_db,
-                offset_secs: 0.0,
-            });
-
-            self.emit(EngineEvent::Format {
-                sample_rate: format.sample_rate,
-                channels: format.channels,
-                codec: format.codec,
+                task,
+                position_seconds: 0.0,
+                attempts_left: self.queue.len(),
+                purpose: OpenPurpose::Advance,
             });
         } else {
-            // A deliberate gap: flush the ring and start the incoming track
-            // from silence, rather than the seamless in-ring join above.
-            self.install_decoder(decoder, next.gain_db);
+            self.open_current(self.queue.len(), OpenPurpose::Advance, 0.0);
         }
-        self.refresh_preload();
+    }
+
+    /// Keeps the ring and its timeline intact at a natural queue boundary.
+    fn install_joined_decoder(&mut self, decoder: Decoder, gain_db: f64) {
+        let format = decoder.format().clone();
+        self.retune_resampler_for_join(format.sample_rate);
+        self.decoder = Some(decoder);
+        self.clear_preload();
+        self.start_measuring(&format);
+        self.clear_loop();
+        let pending_frames = self.pending_out.len() as u64 / self.device_channels().max(1) as u64
+            + self.chain.pending_output_frames();
+        self.boundaries.push_back(Boundary {
+            frame: self.frames_written + pending_frames,
+            index: self.queue.index(),
+            duration_secs: self.current_duration,
+            gain_db,
+            offset_secs: 0.0,
+        });
+        self.emit(EngineEvent::Format {
+            sample_rate: format.sample_rate,
+            channels: format.channels,
+            codec: format.codec,
+        });
     }
 
     // ── output plumbing ─────────────────────────────────────────────────
@@ -1912,9 +2136,12 @@ impl Engine {
     /// mapped source seconds instead; frames no marker covers were 1:1 by
     /// construction and keep the division.
     fn position_secs(&self) -> f64 {
+        if let Some(pending) = self.pending_current.as_ref() {
+            return pending.position_seconds;
+        }
         let rate = self.device_rate();
         if rate == 0 {
-            return 0.0;
+            return self.boundaries.back().map(|b| b.offset_secs).unwrap_or(0.0);
         }
         let played = self.params.frames_played();
         let origin = self.boundaries.iter().rev().find(|b| b.frame <= played);
@@ -2082,6 +2309,7 @@ fn equal_power(t: f32) -> (f32, f32) {
 mod tests {
     use super::*;
     use crate::fixtures;
+    use std::future::Future;
     use std::io::Write;
 
     /// These tests are about audio reaching the device, not about remembering
@@ -2140,6 +2368,335 @@ mod tests {
             self.0.lock().unwrap().push(event);
         }
         fn send_frame(&self, _frame: &[u8]) {}
+    }
+
+    type ResolveReply = tokio::sync::oneshot::Sender<Result<crate::RemoteFile, String>>;
+
+    #[derive(Debug)]
+    struct ResolveCall {
+        id: String,
+        reply: ResolveReply,
+        thread: std::thread::ThreadId,
+    }
+
+    struct ControlledResolver(std::sync::mpsc::Sender<ResolveCall>);
+
+    impl SourceResolver for ControlledResolver {
+        fn resolve<'a>(
+            &'a self,
+            id: &'a str,
+        ) -> std::pin::Pin<Box<dyn Future<Output = Result<crate::RemoteFile, String>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                let (reply, receiver) = tokio::sync::oneshot::channel();
+                self.0
+                    .send(ResolveCall {
+                        id: id.to_owned(),
+                        reply,
+                        thread: std::thread::current().id(),
+                    })
+                    .expect("test receives calls");
+                receiver
+                    .await
+                    .unwrap_or_else(|_| Err("cancelled by test".to_owned()))
+            })
+        }
+    }
+
+    fn controlled_resolver() -> (
+        Arc<dyn SourceResolver>,
+        std::sync::mpsc::Receiver<ResolveCall>,
+    ) {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        (Arc::new(ControlledResolver(sender)), receiver)
+    }
+
+    fn deferred_entry(track_id: i64, id: &str) -> QueueEntry {
+        QueueEntry {
+            track_id,
+            location: Location::Deferred(crate::DeferredSource { id: id.to_owned() }),
+            duration_secs: 1.0,
+            gain_db: 0.0,
+        }
+    }
+
+    fn next_resolve(calls: &std::sync::mpsc::Receiver<ResolveCall>) -> ResolveCall {
+        calls
+            .recv_timeout(Duration::from_secs(5))
+            .expect("resolver is polled")
+    }
+
+    fn assert_cancelled(mut reply: ResolveReply) {
+        test_runtime().block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), reply.closed())
+                .await
+                .expect("superseded resolution is dropped");
+        });
+    }
+
+    fn until(mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !done() {
+            assert!(Instant::now() < deadline, "worker did not complete");
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn deferred_current_is_cancellable_and_never_resolves_on_the_engine_thread() {
+        let mut engine = bare_engine();
+        let (resolver, calls) = controlled_resolver();
+        engine.handle(EngineCommand::SetSourceResolver(resolver));
+        engine.handle(EngineCommand::LoadQueue {
+            entries: vec![deferred_entry(1, "first"), deferred_entry(2, "second")],
+            index: 0,
+        });
+        let first = next_resolve(&calls);
+        assert_eq!(first.id, "first");
+        assert_ne!(first.thread, std::thread::current().id());
+        assert!(engine.output.is_none(), "resolution precedes output setup");
+        engine.handle(EngineCommand::Next);
+        let second = next_resolve(&calls);
+        assert_eq!(second.id, "second");
+        assert_cancelled(first.reply);
+        engine.handle(EngineCommand::Stop);
+        assert_cancelled(second.reply);
+        assert!(!engine.poll_current());
+        assert!(engine.decoder.is_none());
+        assert_eq!(engine.mode, Mode::Idle);
+    }
+
+    #[test]
+    fn replacing_the_resolver_restarts_only_the_wanted_open() {
+        let mut engine = bare_engine();
+        let (resolver, old_calls) = controlled_resolver();
+        engine.handle(EngineCommand::SetSourceResolver(resolver));
+        engine.handle(EngineCommand::LoadQueue {
+            entries: vec![deferred_entry(1, "stable")],
+            index: 0,
+        });
+        let old = next_resolve(&old_calls);
+        let (replacement, new_calls) = controlled_resolver();
+        engine.handle(EngineCommand::SetSourceResolver(replacement));
+        let new = next_resolve(&new_calls);
+        assert_cancelled(old.reply);
+        assert_eq!(new.id, "stable");
+        engine.stop();
+        assert_cancelled(new.reply);
+    }
+
+    #[test]
+    fn repeating_deferred_failures_try_one_queue_pass() {
+        let (mut engine, sink) = captured_engine();
+        let (resolver, calls) = controlled_resolver();
+        engine.handle(EngineCommand::SetSourceResolver(resolver));
+        engine.queue.set_repeat(true);
+        engine.handle(EngineCommand::LoadQueue {
+            entries: vec![deferred_entry(1, "first"), deferred_entry(2, "second")],
+            index: 0,
+        });
+        for (id, track_id) in [("first", 1), ("second", 2)] {
+            let call = next_resolve(&calls);
+            assert_eq!(call.id, id);
+            call.reply.send(Err("unavailable".to_owned())).unwrap();
+            until(|| {
+                engine.poll_current();
+                engine.mode == Mode::Idle
+                    || engine
+                        .pending_current
+                        .as_ref()
+                        .is_some_and(|p| p.entry.track_id != track_id)
+            });
+        }
+        assert_eq!(engine.mode, Mode::Idle);
+        assert!(!engine.playing);
+        assert!(calls.try_recv().is_err());
+        assert_eq!(
+            sink.0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| { matches!(event, EngineEvent::Error { .. }) })
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn a_natural_transition_adopts_the_pending_preload_without_resolving_again() {
+        let mut engine = bare_engine();
+        let (resolver, calls) = controlled_resolver();
+        engine.resolver = Some(resolver);
+        engine.queue.load(
+            vec![deferred_entry(1, "outgoing"), deferred_entry(2, "incoming")],
+            0,
+        );
+        engine.mode = Mode::Local;
+        engine.playing = true;
+        engine.current_duration = 1.0;
+        engine.refresh_preload();
+        let call = next_resolve(&calls);
+        assert_eq!(call.id, "incoming");
+        assert!(
+            !engine.maybe_start_transition(),
+            "a blocked resolver cannot stall the ring"
+        );
+        engine.advance_or_stop();
+        assert!(engine.pending_current.is_some());
+        for _ in 0..10 {
+            assert!(!engine.poll_current());
+            assert!(!engine.pump());
+        }
+        assert!(
+            calls.try_recv().is_err(),
+            "one actual open, not one per pump"
+        );
+        engine.stop();
+        assert_cancelled(call.reply);
+    }
+
+    #[test]
+    fn deferred_preload_decodes_real_audio_and_keeps_the_queue_identity() {
+        let mut engine = bare_engine();
+        let (resolver, calls) = controlled_resolver();
+        engine.resolver = Some(resolver);
+        let incoming = deferred_entry(2, "incoming");
+        engine
+            .queue
+            .load(vec![deferred_entry(1, "outgoing"), incoming.clone()], 0);
+        engine.mode = Mode::Local;
+        engine.current_duration = 1.0;
+        engine.refresh_preload();
+        let call = next_resolve(&calls);
+        assert_eq!(call.id, "incoming");
+        let address = crate::remote::test_server::serve(fixtures::wav_bytes(
+            8_000,
+            1,
+            &fixtures::silence(1, 8_000),
+        ));
+        call.reply
+            .send(Ok(crate::RemoteFile {
+                url: format!("{address}/track.wav"),
+                extension: Some("wav".to_owned()),
+                bounded_range: None,
+            }))
+            .unwrap();
+        until(|| {
+            engine.refresh_preload();
+            engine.preloaded.is_some()
+        });
+        assert_eq!(engine.preloaded_entry.as_ref(), Some(&incoming));
+        assert_eq!(engine.queue.peek_next(), Some(&incoming));
+        engine.advance_or_stop();
+        assert_eq!(engine.queue.current(), Some(&incoming));
+        assert_eq!(engine.decoder.as_ref().unwrap().format().sample_rate, 8_000);
+        assert!(calls.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_same_track_id_with_a_new_location_discards_the_old_preload() {
+        let mut engine = bare_engine();
+        let (resolver, calls) = controlled_resolver();
+        engine.resolver = Some(resolver);
+        engine.mode = Mode::Local;
+        engine.current_duration = 1.0;
+        engine.queue.load(
+            vec![deferred_entry(1, "current"), deferred_entry(2, "old")],
+            0,
+        );
+        engine.refresh_preload();
+        let old = next_resolve(&calls);
+        engine.queue.load(
+            vec![deferred_entry(1, "current"), deferred_entry(2, "new")],
+            0,
+        );
+        engine.refresh_preload();
+        let new = next_resolve(&calls);
+        assert_eq!(new.id, "new");
+        assert_cancelled(old.reply);
+        engine.stop();
+        assert_cancelled(new.reply);
+    }
+
+    #[test]
+    fn refresh_preserves_pause_position_queue_and_reported_identity_while_pending() {
+        let (mut engine, sink) = captured_engine();
+        let (resolver, calls) = controlled_resolver();
+        engine.resolver = Some(resolver);
+        engine
+            .queue
+            .load(vec![deferred_entry(1, "one"), deferred_entry(2, "two")], 0);
+        engine.queue.set_shuffle(true);
+        engine.queue.set_repeat(true);
+        engine.mode = Mode::Local;
+        engine.reported_index = Some(engine.queue.index());
+        let index = engine.queue.index();
+        let next = engine.queue.peek_next().cloned();
+        engine.handle(EngineCommand::RefreshCurrent {
+            position_seconds: 0.5,
+            playing: false,
+        });
+        let first = next_resolve(&calls);
+        assert!(!engine.playing);
+        assert_eq!(engine.position_secs(), 0.5);
+        engine.set_playing(true);
+        engine.set_playing(false);
+        assert!(engine.seek(0.75));
+        let second = next_resolve(&calls);
+        assert_cancelled(first.reply);
+        assert!(!engine.playing);
+        assert_eq!(engine.position_secs(), 0.75);
+        assert_eq!(engine.reported_index, Some(index));
+        assert_eq!(engine.queue.index(), index);
+        assert_eq!(engine.queue.peek_next(), next.as_ref());
+        assert!(engine.queue.shuffle() && engine.queue.repeat());
+        assert!(!sink
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| matches!(event, EngineEvent::TrackChanged { .. })));
+        engine.stop();
+        assert_cancelled(second.reply);
+    }
+
+    #[test]
+    fn refresh_worker_seeks_before_the_same_identity_decoder_is_installed() {
+        let (path, entry) = wav_track(1, "audio-stack-refresh-worker");
+        let (mut engine, sink) = captured_engine();
+        engine.queue.load(vec![entry.clone()], 0);
+        engine.mode = Mode::Local;
+        engine.reported_index = Some(0);
+        engine.refresh_current(0.5, false);
+        let pending = engine.pending_current.take().expect("worker owns reopen");
+        let mut result = None;
+        until(|| {
+            if let Ok(opened) = pending.task.try_recv() {
+                result = Some(opened.expect("native wav reopen"));
+                true
+            } else {
+                false
+            }
+        });
+        let opened = result.unwrap();
+        assert!((opened.position_seconds - 0.5).abs() < 0.01);
+        assert!((opened.decoder.position_secs() - 0.5).abs() < 0.01);
+        // Exercise installation separately from ensure_output, with the native
+        // decoder returned by the real worker and no synthetic audio device.
+        engine.install_decoder_at(opened.decoder, entry.gain_db, opened.position_seconds, true);
+        engine.finish_measuring(false);
+        engine.emit_progress_now();
+        assert!(!engine.playing);
+        assert!((engine.position_secs() - 0.5).abs() < 0.01);
+        assert_eq!(engine.reported_index, Some(0));
+        assert!(engine.measuring.is_none());
+        assert!(!sink
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| matches!(event, EngineEvent::TrackChanged { .. })));
+        std::fs::remove_file(path).unwrap();
     }
 
     fn captured_engine() -> (Engine, Arc<CaptureSink>) {

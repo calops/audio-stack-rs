@@ -46,6 +46,7 @@ mod pitch;
 mod queue;
 mod remote;
 mod resample;
+mod source;
 mod spectral;
 mod stream;
 #[cfg(feature = "stretch")]
@@ -78,7 +79,8 @@ pub use nowplaying::Source;
 pub use output::AudioDevice;
 pub use overview::{OverviewSlice, OVERVIEW_SLICES_PER_SECOND};
 pub use params::{CENTER_FREQS, EQ_BAND_COUNT};
-pub use queue::{BoundedRange, Location, QueueEntry, RemoteFile};
+pub use queue::{BoundedRange, DeferredSource, Location, QueueEntry, RemoteFile};
+pub use source::SourceResolver;
 
 /// Where the engine sends what the host renders: transport [`EngineEvent`]s and
 /// the raw visual frame (`FRAME_BYTES` bytes, ~60 Hz). The host implements this
@@ -104,6 +106,7 @@ pub struct AudioEngine {
     station_epoch: Arc<AtomicU64>,
     /// Cheap clone used to spawn the detached network tasks.
     handle: tokio::runtime::Handle,
+    resolver: Mutex<Option<Arc<dyn SourceResolver>>>,
     /// The owned runtime, taken and dropped without waiting on
     /// [`AudioEngine::shutdown`] / drop, so a long poll sleep cannot stall exit.
     runtime: Mutex<Option<tokio::runtime::Runtime>>,
@@ -116,6 +119,28 @@ impl AudioEngine {
     /// Replaces the queue and starts at `index`.
     pub fn load_queue(&self, entries: Vec<QueueEntry>, index: usize) {
         let _ = self.send(EngineCommand::LoadQueue { entries, index });
+    }
+
+    /// Installs the host's deferred-source resolver. Resolution runs on opener
+    /// workers; credentials and URL expiration policy stay with the host.
+    pub fn set_source_resolver(&self, resolver: Arc<dyn SourceResolver>) -> Result<(), String> {
+        let mut current = self
+            .resolver
+            .lock()
+            .map_err(|_| "source resolver lock poisoned".to_owned())?;
+        self.send(EngineCommand::SetSourceResolver(Arc::clone(&resolver)))?;
+        *current = Some(resolver);
+        Ok(())
+    }
+
+    /// Reopens the current queued source and seeks before installing it.
+    /// Preserves queue order and track identity; `playing` selects the state
+    /// after opening. The host decides when a source needs refreshing.
+    pub fn refresh_current(&self, position_seconds: f64, playing: bool) {
+        let _ = self.send(EngineCommand::RefreshCurrent {
+            position_seconds,
+            playing,
+        });
     }
 
     /// Connects to a station and hands the buffered reader to the engine.
@@ -352,7 +377,12 @@ impl AudioEngine {
         location: &Location,
         on_slices: &mut dyn FnMut(&[OverviewSlice]) -> std::ops::ControlFlow<()>,
     ) -> Result<bool, String> {
-        overview::read(location, &self.handle, on_slices)
+        let resolver = self
+            .resolver
+            .lock()
+            .map_err(|_| "source resolver lock poisoned".to_owned())?
+            .clone();
+        overview::read(location, resolver, &self.handle, on_slices)
     }
 
     // ── output devices ────────────────────────────────────────────────────────
@@ -474,6 +504,7 @@ pub fn init(
         params,
         station_epoch,
         handle,
+        resolver: Mutex::new(None),
         runtime: Mutex::new(Some(runtime)),
         join: Mutex::new(Some(join)),
     }

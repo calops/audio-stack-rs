@@ -7,13 +7,10 @@
 //! Both preserve whole-file duration, seeking, gapless playback and loudness.
 //!
 //! Connecting is async because the HTTP fetch is; the engine thread is not.
-//! [`open_blocking`] drives the connect on the engine's own runtime, for the
-//! places that need a decoder now (the listener pressed play), and
-//! [`open_in_background`] does the same on a thread of its own, so preloading
-//! the next track never stalls the audio already playing.
+//! [`open_blocking`] drives the connect on the engine's own runtime for
+//! synchronous workers. The generic source opener handles background decoding.
 
 use std::io::{Read, Seek, SeekFrom};
-use std::sync::mpsc;
 use std::time::Duration;
 
 use stream_download::http::reqwest::{self, Client};
@@ -67,7 +64,7 @@ impl<R: Read + Seek + Send + Sync> MediaSource for RemoteSource<R> {
 }
 
 /// Connects to the file and buffers its start.
-async fn connect(remote: &RemoteFile) -> Result<(Box<dyn MediaSource>, Hint), String> {
+pub(crate) async fn connect(remote: &RemoteFile) -> Result<(Box<dyn MediaSource>, Hint), String> {
     let shown = super::queue::Location::Remote(remote.clone()).to_string();
     let parsed: reqwest::Url = remote
         .url
@@ -164,24 +161,6 @@ pub fn open_blocking(
 ) -> Result<Decoder, String> {
     let (source, hint) = runtime.block_on(connect(remote))?;
     Decoder::open(source, hint)
-}
-
-/// Opens a decoder over a remote file on a thread of its own. The answer
-/// arrives on the returned channel; dropping the receiver abandons it.
-pub fn open_in_background(
-    remote: RemoteFile,
-    runtime: tokio::runtime::Handle,
-) -> mpsc::Receiver<Result<Decoder, String>> {
-    let (sender, receiver) = mpsc::channel();
-    let spawned = std::thread::Builder::new()
-        .name("remote track opener".to_owned())
-        .spawn(move || {
-            let _ = sender.send(open_blocking(&remote, &runtime));
-        });
-    if let Err(error) = spawned {
-        log::warn!("start the remote track opener: {error}");
-    }
-    receiver
 }
 
 #[cfg(test)]
@@ -336,11 +315,26 @@ mod tests {
     #[test]
     fn a_background_open_delivers_its_decoder() {
         let address = test_server::serve(wav_bytes(8_000, 1, &ramp(1, 8_000)));
-        let receiver =
-            open_in_background(remote(&address, "/track.wav"), runtime().handle().clone());
-        let decoder = receiver
-            .recv_timeout(Duration::from_secs(10))
-            .expect("the opener answers");
-        assert!(decoder.is_ok());
+        let task = crate::source::open_in_background(
+            crate::queue::Location::Remote(remote(&address, "/track.wav")),
+            None,
+            runtime().handle().clone(),
+            0.5,
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut opened = loop {
+            match task.try_recv() {
+                Ok(result) => break result.expect("the decoder opens"),
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    assert!(std::time::Instant::now() < deadline, "the opener answers");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("the opener disconnected: {error}"),
+            }
+        };
+        assert!((opened.position_seconds - 0.5).abs() < 0.001);
+        let mut audio = [0.0; 128];
+        assert!(opened.decoder.read(&mut audio).unwrap() > 0);
+        assert!(audio[0] > 0.4);
     }
 }

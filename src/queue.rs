@@ -13,8 +13,8 @@ use std::path::PathBuf;
 
 /// Where a queued track's bytes come from.
 ///
-/// Deserializes from a plain string (a file path) or from an object with a
-/// `url`, so a host payload written before remote tracks existed still loads.
+/// Deserializes from a plain string (a file path), an object with a `url`
+/// (a remote file), or an object with an `id` (resolved by the host at open).
 #[derive(Clone, Debug, PartialEq, serde::Deserialize)]
 #[serde(untagged)]
 pub enum Location {
@@ -25,6 +25,15 @@ pub enum Location {
     /// range requests, so it plays exactly like a local file: seek, gapless,
     /// crossfade and loudness measurement all apply.
     Remote(RemoteFile),
+    /// A stable host identity resolved afresh whenever its bytes are opened.
+    Deferred(DeferredSource),
+}
+
+/// A stable source identity, not an expiring address.
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeferredSource {
+    pub id: String,
 }
 
 /// A finite audio file on a server.
@@ -74,15 +83,22 @@ impl From<PathBuf> for Location {
 }
 
 impl std::fmt::Display for Location {
-    /// A file shows its path; a remote file shows its address without the
-    /// query, which may carry credentials that do not belong in a log.
+    /// A file shows its path; a remote file omits user info, query and fragment,
+    /// which may carry credentials that do not belong in a log.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Location::File(path) => write!(formatter, "{}", path.display()),
             Location::Remote(remote) => {
-                let address = remote.url.split('?').next().unwrap_or_default();
+                let address = remote.url.split(['?', '#']).next().unwrap_or_default();
+                if let Some((scheme, rest)) = address.split_once("://") {
+                    let authority_end = rest.find('/').unwrap_or(rest.len());
+                    if let Some(user_info_end) = rest[..authority_end].rfind('@') {
+                        return write!(formatter, "{scheme}://{}", &rest[user_info_end + 1..]);
+                    }
+                }
                 write!(formatter, "{address}")
             }
+            Location::Deferred(_) => formatter.write_str("deferred source"),
         }
     }
 }
@@ -96,7 +112,7 @@ impl std::fmt::Display for Location {
 pub struct QueueEntry {
     /// The host's stable id for this track.
     pub track_id: i64,
-    /// Where the audio is: a file on disk or a file on a server.
+    /// Where the audio is, or the stable identity used to resolve it.
     #[serde(alias = "path")]
     pub location: Location,
     /// Duration, in seconds, as known by the host.
@@ -339,6 +355,53 @@ mod tests {
             "http://server/a",
             "the credentials in the query stay out of what is shown"
         );
+    }
+
+    #[test]
+    fn deferred_payloads_are_objects_and_never_confused_with_files_or_urls() {
+        let entry: QueueEntry = serde_json::from_str(
+            r#"{"trackId":3,"location":{"id":"provider:stable-id"},"durationSecs":3.0}"#,
+        )
+        .expect("a deferred payload deserializes");
+        assert_eq!(
+            entry.location,
+            Location::Deferred(DeferredSource {
+                id: "provider:stable-id".to_owned(),
+            })
+        );
+        assert_eq!(entry.location.to_string(), "deferred source");
+        assert_eq!(
+            serde_json::from_str::<Location>(r#""provider:stable-id""#).unwrap(),
+            Location::File(PathBuf::from("provider:stable-id"))
+        );
+        for payload in [r#"{"id":"stable","extension":"wav"}"#, r#"{}"#] {
+            assert!(
+                serde_json::from_str::<Location>(payload).is_err(),
+                "{payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_objects_keep_priority_and_accept_existing_host_metadata() {
+        let location: Location = serde_json::from_str(
+            r#"{"id":"stable","url":"https://server/track","title":"host metadata"}"#,
+        )
+        .unwrap();
+        let Location::Remote(file) = location else {
+            panic!("an existing URL object remains a remote source");
+        };
+        assert_eq!(file.url, "https://server/track");
+    }
+
+    #[test]
+    fn remote_display_hides_all_url_credentials() {
+        let location = Location::Remote(RemoteFile {
+            url: "https://user:password@server/track?token=secret#private".to_owned(),
+            extension: None,
+            bounded_range: None,
+        });
+        assert_eq!(location.to_string(), "https://server/track");
     }
 
     #[test]
