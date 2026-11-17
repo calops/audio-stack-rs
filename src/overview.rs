@@ -274,6 +274,7 @@ mod tests {
         let remote = Location::Remote(RemoteFile {
             url: format!("{address}/track.wav?api_key=secret"),
             extension: Some("wav".to_owned()),
+            bounded_range: None,
         });
 
         assert_eq!(read_all(&remote), read_all(&Location::File(path)));

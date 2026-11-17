@@ -78,7 +78,7 @@ pub use nowplaying::Source;
 pub use output::AudioDevice;
 pub use overview::{OverviewSlice, OVERVIEW_SLICES_PER_SECOND};
 pub use params::{CENTER_FREQS, EQ_BAND_COUNT};
-pub use queue::{Location, QueueEntry, RemoteFile};
+pub use queue::{BoundedRange, Location, QueueEntry, RemoteFile};
 
 /// Where the engine sends what the host renders: transport [`EngineEvent`]s and
 /// the raw visual frame (`FRAME_BYTES` bytes, ~60 Hz). The host implements this

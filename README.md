@@ -125,6 +125,42 @@ Web radio is one async call, driven by your runtime:
 engine.play_stream("groovesalad".into(), "https://ice.somafm.com/groovesalad-128-mp3".into(), None).await?;
 ```
 
+Finite remote files use `Location::Remote`. The default transport uses an
+ordinary streaming GET and buffers to a temporary file, including for servers
+without range support. Existing JSON payloads keep this behavior.
+
+For servers that require a finite byte range on every request, opt in per file:
+
+```rust
+use audio_stack_rs::{BoundedRange, Location, RemoteFile};
+
+let location = Location::Remote(RemoteFile {
+    url: "https://media.example/track.m4a?token=secret".into(),
+    extension: Some("m4a".into()),
+    bounded_range: Some(BoundedRange {
+        content_length: Some(12_345_678), // whole file, not one chunk
+        ..Default::default()
+    }),
+});
+```
+
+Use `bounded_range: None` for the ordinary transport. `BoundedRange` defaults to
+1 MiB requests; `chunk_size` is a `NonZeroU64`. If `content_length` is `None`,
+the first response's `Content-Range` supplies the whole-file length. JSON uses
+`"bounded_range": {"chunk_size": 1048576, "content_length": 12345678}`.
+
+Bounded mode requires `206 Partial Content`, an exact `Content-Range` with a
+finite, stable total, and an unencoded body of the stated length. A server that
+ignores ranges, returns a short body, or changes the total fails the track.
+There is no automatic retry or fallback to an unbounded GET. Seeks fetch only
+bounded ranges, including the final short chunk; EOF sends no request.
+
+The current chunk and one asynchronous lookahead chunk stay in memory instead
+of downloading the whole file. Network waits happen on decoder/opener threads,
+never the audio callback. Seeking outside the current position or dropping a
+source cancels lookahead, including an in-flight response. Background next-track
+preloading and native overview decoding use the same transport.
+
 Metadata parsing is standalone — no engine required:
 
 ```rust
