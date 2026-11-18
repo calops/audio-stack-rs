@@ -1,10 +1,10 @@
 //! A whole audio file on a server, as a seekable media source.
 //!
 //! Unlike a station, a media server's file has an end and a length. It is
-//! downloaded into a temporary file as it plays, and a seek past what has
-//! arrived becomes an HTTP range request, so the decoder sees something that
-//! behaves like a file on disk: the track keeps its duration, its seek bar,
-//! its gapless join and its loudness measurement.
+//! downloaded into a temporary file as it plays by default, and a seek past
+//! what has arrived becomes an HTTP range request. An opt-in bounded-range
+//! transport instead keeps two chunks in memory and sends only finite ranges.
+//! Both preserve whole-file duration, seeking, gapless playback and loudness.
 //!
 //! Connecting is async because the HTTP fetch is; the engine thread is not.
 //! [`open_blocking`] drives the connect on the engine's own runtime, for the
@@ -25,6 +25,8 @@ use symphonia::core::io::MediaSource;
 
 use super::decode::Decoder;
 use super::queue::RemoteFile;
+
+mod bounded;
 
 /// Bytes downloaded before decoding starts: enough for any container's
 /// header and the first seconds of audio, small enough to start at once.
@@ -85,6 +87,21 @@ async fn connect(remote: &RemoteFile) -> Result<(Box<dyn MediaSource>, Hint), St
         .read_timeout(READ_TIMEOUT)
         .build()
         .map_err(|error| format!("build http client: {error}"))?;
+
+    if let Some(config) = &remote.bounded_range {
+        let (source, content_type) =
+            bounded::Source::connect(client, parsed, config, shown.clone())
+                .await
+                .map_err(|error| format!("{shown}: {error}"))?;
+        let mut hint = Hint::new();
+        if let Some(extension) = remote.extension.as_deref() {
+            hint.with_extension(extension);
+        }
+        if let Some(mime) = content_type {
+            hint.mime_type(&mime);
+        }
+        return Ok((Box::new(source), hint));
+    }
 
     // An HTTP error status (a missing item, a revoked token) fails here, so it
     // reaches the listener as an unplayable track rather than as silence.
@@ -256,6 +273,7 @@ mod tests {
         RemoteFile {
             url: format!("{address}{path}?api_key=secret"),
             extension: Some("wav".to_owned()),
+            bounded_range: None,
         }
     }
 

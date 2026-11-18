@@ -3079,6 +3079,7 @@ mod tests {
                     location: Location::Remote(crate::RemoteFile {
                         url: format!("{address}/track.wav?api_key=secret"),
                         extension: Some("wav".to_owned()),
+                        bounded_range: None,
                     }),
                     duration_secs: 1.0,
                     gain_db: 0.0,

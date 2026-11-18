@@ -37,6 +37,34 @@ pub struct RemoteFile {
     /// hint than a vague `Content-Type`.
     #[serde(default)]
     pub extension: Option<String>,
+    /// Opt into strictly bounded HTTP ranges. `None` keeps the ordinary
+    /// streaming GET transport, including servers without range support.
+    #[serde(default)]
+    pub bounded_range: Option<BoundedRange>,
+}
+
+/// Transport settings for finite files whose server requires bounded ranges.
+///
+/// Every request, including the first and requests after seeks, specifies both
+/// byte offsets. Servers must return an exact `206` range and a finite total.
+/// Memory holds at most the current chunk and one asynchronous lookahead chunk.
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+#[serde(default)]
+pub struct BoundedRange {
+    /// Maximum bytes per request. Defaults to 1 MiB; zero is not valid.
+    pub chunk_size: std::num::NonZeroU64,
+    /// Expected whole-file length, when known. Must agree with `Content-Range`.
+    /// If absent, the first response supplies the length.
+    pub content_length: Option<u64>,
+}
+
+impl Default for BoundedRange {
+    fn default() -> Self {
+        Self {
+            chunk_size: std::num::NonZeroU64::new(1024 * 1024).expect("nonzero chunk size"),
+            content_length: None,
+        }
+    }
 }
 
 impl From<PathBuf> for Location {
@@ -305,11 +333,27 @@ mod tests {
             panic!("expected a remote location");
         };
         assert_eq!(remote.extension.as_deref(), Some("flac"));
+        assert!(remote.bounded_range.is_none());
         assert_eq!(
             entry.location.to_string(),
             "http://server/a",
             "the credentials in the query stay out of what is shown"
         );
+    }
+
+    #[test]
+    fn bounded_range_payloads_opt_in_and_reject_zero_chunk_sizes() {
+        let remote: RemoteFile = serde_json::from_str(
+            r#"{"url":"http://server/a","bounded_range":{"chunk_size":7,"content_length":53}}"#,
+        )
+        .unwrap();
+        let config = remote.bounded_range.unwrap();
+        assert_eq!(config.chunk_size.get(), 7);
+        assert_eq!(config.content_length, Some(53));
+        assert!(serde_json::from_str::<RemoteFile>(
+            r#"{"url":"http://server/a","bounded_range":{"chunk_size":0}}"#,
+        )
+        .is_err());
     }
 
     fn queue(count: usize, index: usize) -> Queue {
