@@ -110,6 +110,9 @@ fn serve(
     notify: mpsc::Sender<(u64, u64)>,
     stalled: Option<mpsc::Sender<bool>>,
 ) {
+    // On macOS an accepted socket inherits the listener's non-blocking flag,
+    // and the first read would fail with WouldBlock before the request lands.
+    socket.set_nonblocking(false).unwrap();
     socket
         .set_read_timeout(Some(Duration::from_secs(3)))
         .unwrap();
@@ -185,7 +188,13 @@ fn serve(
     if let Some(stalled) = stalled.filter(|_| start > 0) {
         let _ = stalled.send(false); // A lookahead request has reached the body.
         let mut byte = [0];
-        let closed = matches!(socket.read(&mut byte), Ok(0));
+        // A client that drops a response mid-body may close with a reset
+        // rather than a FIN; both mean the request was abandoned.
+        let closed = match socket.read(&mut byte) {
+            Ok(0) => true,
+            Err(error) => error.kind() == io::ErrorKind::ConnectionReset,
+            Ok(_) => false,
+        };
         let _ = stalled.send(closed);
         return;
     }
