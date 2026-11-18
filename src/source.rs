@@ -25,7 +25,7 @@ pub trait SourceResolver: Send + Sync {
 /// A decoder positioned on the blocking worker, ready for the engine to adopt.
 pub(crate) struct OpenedSource {
     pub decoder: Decoder,
-    pub position_seconds: f64,
+    pub position_secs: f64,
 }
 
 /// An asynchronous open owned by the playback operation that requested it.
@@ -67,11 +67,11 @@ pub(crate) fn open_in_background(
     location: Location,
     resolver: Option<Arc<dyn SourceResolver>>,
     runtime: Handle,
-    position_seconds: f64,
+    position_secs: f64,
 ) -> OpenTask {
     let (sender, receiver) = mpsc::channel();
     let task = runtime.spawn(async move {
-        let result = open(location, resolver, position_seconds).await;
+        let result = open(location, resolver, position_secs).await;
         let _ = sender.send(result);
     });
     OpenTask { receiver, task }
@@ -80,14 +80,14 @@ pub(crate) fn open_in_background(
 async fn open(
     location: Location,
     resolver: Option<Arc<dyn SourceResolver>>,
-    position_seconds: f64,
+    position_secs: f64,
 ) -> Result<OpenedSource, String> {
-    if !position_seconds.is_finite() || position_seconds < 0.0 {
+    if !position_secs.is_finite() || position_secs < 0.0 {
         return Err("source position must be finite and nonnegative".to_owned());
     }
     let worker = match location {
         Location::File(path) => tokio::task::spawn_blocking(move || {
-            finish_open(Decoder::open_file(&path)?, position_seconds)
+            finish_open(Decoder::open_file(&path)?, position_secs)
         }),
         location => {
             let file = match location {
@@ -100,7 +100,7 @@ async fn open(
             };
             let (source, hint) = remote::connect(&file).await?;
             tokio::task::spawn_blocking(move || {
-                finish_open(Decoder::open(source, hint)?, position_seconds)
+                finish_open(Decoder::open(source, hint)?, position_secs)
             })
         }
     };
@@ -112,15 +112,15 @@ async fn open(
         .map_err(|error| format!("source opener worker: {error}"))?
 }
 
-fn finish_open(mut decoder: Decoder, position_seconds: f64) -> Result<OpenedSource, String> {
-    let position_seconds = if position_seconds > 0.0 {
-        decoder.seek(position_seconds)?
+fn finish_open(mut decoder: Decoder, position_secs: f64) -> Result<OpenedSource, String> {
+    let position_secs = if position_secs > 0.0 {
+        decoder.seek(position_secs)?
     } else {
         decoder.position_secs()
     };
     Ok(OpenedSource {
         decoder,
-        position_seconds,
+        position_secs,
     })
 }
 

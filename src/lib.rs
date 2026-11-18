@@ -138,18 +138,18 @@ impl AudioEngine {
     /// after opening. The host decides when a source needs refreshing.
     /// A successful installation confirms the reanchored position with
     /// [`EngineEvent::Seeked`], including when the logical point is unchanged.
-    pub fn refresh_current(&self, position_seconds: f64, playing: bool) {
+    pub fn refresh_current(&self, position_secs: f64, playing: bool) {
         let _ = self.send(EngineCommand::RefreshCurrent {
-            position_seconds,
+            position_secs,
             playing,
         });
     }
     /// Like [`refresh_current`](Self::refresh_current), but atomically ignored
     /// if local playback no longer has `track_id` when the engine executes it.
-    pub fn refresh_track(&self, track_id: i64, position_seconds: f64, playing: bool) {
+    pub fn refresh_track(&self, track_id: i64, position_secs: f64, playing: bool) {
         let _ = self.send(EngineCommand::RefreshTrack {
             track_id,
-            position_seconds,
+            position_secs,
             playing,
         });
     }

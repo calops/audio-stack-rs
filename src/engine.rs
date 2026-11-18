@@ -55,12 +55,12 @@ pub enum EngineCommand {
     },
     SetSourceResolver(Arc<dyn SourceResolver>),
     RefreshCurrent {
-        position_seconds: f64,
+        position_secs: f64,
         playing: bool,
     },
     RefreshTrack {
         track_id: i64,
-        position_seconds: f64,
+        position_secs: f64,
         playing: bool,
     },
     /// Plays an already-connected station. The HTTP round trip happens in the
@@ -266,7 +266,7 @@ struct PendingCurrent {
     entry: QueueEntry,
     index: usize,
     task: OpenTask,
-    position_seconds: f64,
+    position_secs: f64,
     attempts_left: usize,
     purpose: OpenPurpose,
     notify_seek: bool,
@@ -489,24 +489,24 @@ impl Engine {
                     self.open_current(
                         pending.attempts_left,
                         pending.purpose,
-                        pending.position_seconds,
+                        pending.position_secs,
                         pending.notify_seek,
                     );
                 }
             }
             EngineCommand::RefreshCurrent {
-                position_seconds,
+                position_secs,
                 playing,
             } => {
-                self.refresh_current(position_seconds, playing);
+                self.refresh_current(position_secs, playing);
             }
             EngineCommand::RefreshTrack {
                 track_id,
-                position_seconds,
+                position_secs,
                 playing,
             } => {
                 if self.matches_track(track_id) {
-                    self.refresh_current(position_seconds, playing);
+                    self.refresh_current(position_secs, playing);
                 }
             }
             EngineCommand::LoadQueue { entries, index } => {
@@ -1377,7 +1377,7 @@ impl Engine {
                     ),
                     entry,
                     index: self.queue.index(),
-                    position_seconds: position,
+                    position_secs: position,
                     attempts_left: attempts,
                     purpose,
                     notify_seek,
@@ -1429,7 +1429,7 @@ impl Engine {
                 opened.decoder,
                 pending.entry,
                 pending.purpose,
-                opened.position_seconds,
+                opened.position_secs,
                 pending.notify_seek,
             ),
             Err(message) => {
@@ -2147,7 +2147,7 @@ impl Engine {
                 entry,
                 index: self.queue.index(),
                 task,
-                position_seconds: 0.0,
+                position_secs: 0.0,
                 attempts_left: self.queue.len(),
                 purpose: OpenPurpose::Advance,
                 notify_seek: false,
@@ -2272,7 +2272,7 @@ impl Engine {
     /// construction and keep the division.
     fn position_secs(&self) -> f64 {
         if let Some(pending) = self.pending_current.as_ref() {
-            return pending.position_seconds;
+            return pending.position_secs;
         }
         let rate = self.device_rate();
         if rate == 0 {
@@ -2798,7 +2798,7 @@ mod tests {
         let index = engine.queue.index();
         let next = engine.queue.peek_next().cloned();
         engine.handle(EngineCommand::RefreshCurrent {
-            position_seconds: 0.5,
+            position_secs: 0.5,
             playing: false,
         });
         let first = next_resolve(&calls);
@@ -2849,7 +2849,7 @@ mod tests {
         sink.0.lock().unwrap().clear();
         engine.handle(EngineCommand::RefreshTrack {
             track_id: entry.track_id,
-            position_seconds: 0.5,
+            position_secs: 0.5,
             playing: false,
         });
         assert!(
@@ -4682,7 +4682,7 @@ mod tests {
         engine.params.reset_frames(u64::from(rate));
         engine.frames_written = u64::from(rate);
         engine.handle(EngineCommand::RefreshCurrent {
-            position_seconds: 0.5,
+            position_secs: 0.5,
             playing: false,
         });
         next_resolve(&calls)
@@ -4822,13 +4822,10 @@ mod tests {
         });
         engine.handle(EngineCommand::RefreshTrack {
             track_id: 1,
-            position_seconds: 0.5,
+            position_secs: 0.5,
             playing: false,
         });
-        assert_eq!(
-            engine.pending_current.as_ref().unwrap().position_seconds,
-            0.0
-        );
+        assert_eq!(engine.pending_current.as_ref().unwrap().position_secs, 0.0);
         assert!(
             calls.try_recv().is_err(),
             "stale seek must not reopen the source"
@@ -5025,7 +5022,7 @@ mod tests {
         engine.queue.load(vec![deferred_entry(9, "refresh")], 0);
         engine.handle(EngineCommand::RefreshTrack {
             track_id: 9,
-            position_seconds: 0.5,
+            position_secs: 0.5,
             playing: false,
         });
         let failed = next_resolve(&calls);
@@ -5043,7 +5040,7 @@ mod tests {
         assert!(seeked_events(&sink).is_empty());
         engine.handle(EngineCommand::RefreshTrack {
             track_id: 9,
-            position_seconds: 0.75,
+            position_secs: 0.75,
             playing: false,
         });
         let cancelled = next_resolve(&calls);
@@ -5068,7 +5065,7 @@ mod tests {
         });
         engine.handle(EngineCommand::RefreshTrack {
             track_id: 1,
-            position_seconds: 0.25,
+            position_secs: 0.25,
             playing: false,
         });
         assert!(

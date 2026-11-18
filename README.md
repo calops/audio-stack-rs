@@ -184,7 +184,7 @@ Failed speculative preloads wait for the normal foreground open rather than
 spinning on repeated resolution.
 
 The host owns authentication, URL caching, and expiration decisions. To replace
-an expired source, call `engine.refresh_current(position_seconds, playing)`.
+an expired source, call `engine.refresh_current(position_secs, playing)`.
 The engine resolves and seeks on a worker before replacing the decoder, keeping
 the queue order and current track identity. `playing` chooses the final
 play/pause state; refresh does not introduce expiration timers or status retries.
@@ -197,7 +197,7 @@ local-queue successor check, including the shuffled cursor and repeat. It is
 false for idle/radio playback; hosts must not infer it from the displayed index.
 
 `engine.seek_track(track_id, position_secs)` and
-`engine.refresh_track(track_id, position_seconds, playing)` queue
+`engine.refresh_track(track_id, position_secs, playing)` queue
 identity-guarded operations: the engine thread ignores them if local playback
 no longer has that track id. During a crossfade the outgoing decoder is the
 target; a stale guard never cancels the fade or seeks the incoming track.
