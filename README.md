@@ -162,6 +162,36 @@ cancels lookahead, including an in-flight response. Cached seeks retain useful
 lookahead; returning to the cached chunk restarts it after an EOF probe.
 Background next-track preloading and native overview decoding use the same transport.
 
+### Deferred sources
+
+Queues can retain a stable source ID instead of a short-lived URL:
+
+```rust
+use audio_stack_rs::{DeferredSource, Location};
+
+let location = Location::Deferred(DeferredSource {
+    id: "catalog:track-id".into(),
+});
+```
+
+Install the host's `Arc<dyn SourceResolver>` with
+`engine.set_source_resolver(resolver)?` before loading deferred entries.
+`SourceResolver::resolve` returns a boxed `Send` future yielding a `RemoteFile`.
+Resolution runs when the source is opened or preloaded, not when the whole
+queue is loaded. JSON uses `{"id": "catalog:track-id"}`; a missing resolver or
+failed resolution is an explicit playback error.
+Failed speculative preloads wait for the normal foreground open rather than
+spinning on repeated resolution.
+
+The host owns authentication, URL caching, and expiration decisions. To replace
+an expired source, call `engine.refresh_current(position_secs, playing)`.
+The engine resolves and seeks on a worker before replacing the decoder, keeping
+the queue order and current track identity. `playing` chooses the final
+play/pause state; refresh does not introduce expiration timers or status retries.
+If refresh fails, playback stays paused at the requested position.
+Superseded opens cancel pending resolution and discard late decoder results.
+`read_overview` uses the same resolver independently of playback.
+
 Metadata parsing is standalone — no engine required:
 
 ```rust
@@ -169,7 +199,7 @@ let meta  = audio_stack_rs::read_metadata(std::path::Path::new("/music/track.fla
 let cover = audio_stack_rs::read_cover("/music/track.flac"); // Option<CoverArt>, base64 data URL parts
 ```
 
-`AudioEngine` methods (`load_queue`, `play`/`pause`/`toggle`/`stop`, `next`/`previous`/`jump_to`, `seek`, `seek_by`, `set_loop`/`clear_loop`, `set_shuffle`/`set_repeat`/`set_normalize`/`set_gapless`/`set_crossfade`, `set_device`, `set_volume`/`set_eq`, `set_time_stretch` with the `stretch` feature, `set_fir_eq` with the `fir-eq` feature, `set_convolution` with the `convolution` feature, `set_pitch_shift` with the `pitch` feature, `play_stream`, `describe`, `devices`, `shutdown`) are the whole control surface. The engine owns a small tokio runtime for its detached network tasks; everything else is synchronous message-passing to the engine thread.
+`AudioEngine` methods (`load_queue`, `set_source_resolver`, `refresh_current`, `play`/`pause`/`toggle`/`stop`, `next`/`previous`/`jump_to`, `seek`, `seek_by`, `set_loop`/`clear_loop`, `set_shuffle`/`set_repeat`/`set_normalize`/`set_gapless`/`set_crossfade`, `set_device`, `set_volume`/`set_eq`, `set_time_stretch` with the `stretch` feature, `set_fir_eq` with the `fir-eq` feature, `set_convolution` with the `convolution` feature, `set_pitch_shift` with the `pitch` feature, `play_stream`, `describe`, `devices`, `shutdown`) are the whole control surface. The engine owns a small tokio runtime for network tasks and deferred resolution; native probing and decoding stay on blocking workers or the engine thread, never the realtime callback.
 
 ## Architecture notes
 

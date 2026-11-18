@@ -145,13 +145,11 @@ fn read_decoder(
 /// [`AudioEngine::read_overview`](crate::AudioEngine::read_overview).
 pub(crate) fn read(
     location: &Location,
+    resolver: Option<std::sync::Arc<dyn crate::SourceResolver>>,
     runtime: &tokio::runtime::Handle,
     on_slices: &mut dyn FnMut(&[OverviewSlice]) -> ControlFlow<()>,
 ) -> Result<bool, String> {
-    let mut decoder = match location {
-        Location::File(path) => Decoder::open_file(path)?,
-        Location::Remote(remote) => crate::remote::open_blocking(remote, runtime)?,
-    };
+    let mut decoder = crate::source::open_blocking(location, resolver, runtime)?;
     read_decoder(&mut decoder, on_slices).map_err(|error| format!("{location}: {error}"))
 }
 
@@ -160,6 +158,8 @@ mod tests {
     use super::*;
     use crate::fixtures::{silence, tone, wav_bytes};
     use crate::queue::RemoteFile;
+    use std::future::Future;
+    use std::pin::Pin;
 
     fn runtime() -> &'static tokio::runtime::Runtime {
         use std::sync::OnceLock;
@@ -182,7 +182,7 @@ mod tests {
 
     fn read_all(location: &Location) -> Vec<OverviewSlice> {
         let mut slices = Vec::new();
-        let finished = read(location, runtime().handle(), &mut |batch| {
+        let finished = read(location, None, runtime().handle(), &mut |batch| {
             slices.extend_from_slice(batch);
             ControlFlow::Continue(())
         })
@@ -256,7 +256,7 @@ mod tests {
             &wav_bytes(rate, 2, &tone(rate, 2, rate as usize * 5, 440.0)),
         );
         let mut batches = 0;
-        let finished = read(&Location::File(path), runtime().handle(), &mut |_| {
+        let finished = read(&Location::File(path), None, runtime().handle(), &mut |_| {
             batches += 1;
             ControlFlow::Break(())
         })
@@ -280,12 +280,57 @@ mod tests {
         assert_eq!(read_all(&remote), read_all(&Location::File(path)));
     }
 
+    struct ServedSource(String);
+
+    impl crate::SourceResolver for ServedSource {
+        fn resolve<'a>(
+            &'a self,
+            _id: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<RemoteFile, String>> + Send + 'a>> {
+            Box::pin(async move {
+                Ok(RemoteFile {
+                    url: self.0.clone(),
+                    extension: Some("wav".to_owned()),
+                    bounded_range: None,
+                })
+            })
+        }
+    }
+
+    #[test]
+    fn a_deferred_source_decodes_the_same_overview_as_its_local_file() {
+        let rate = 8_000;
+        let bytes = wav_bytes(rate, 1, &tone(rate, 1, rate as usize * 2, 220.0));
+        let path = fixture_file("deferred-copy", &bytes);
+        let address = crate::remote::test_server::serve(bytes);
+        let location = Location::Deferred(crate::DeferredSource {
+            id: "saved-track".to_owned(),
+        });
+        let resolver = std::sync::Arc::new(ServedSource(format!("{address}/track.wav")));
+        let mut slices = Vec::new();
+        let finished = read(
+            &location,
+            Some(resolver),
+            runtime().handle(),
+            &mut |batch| {
+                slices.extend_from_slice(batch);
+                ControlFlow::Continue(())
+            },
+        )
+        .expect("the host-resolved source decodes");
+        assert!(finished);
+        assert_eq!(slices, read_all(&Location::File(path)));
+    }
+
     #[test]
     fn a_missing_file_is_an_error() {
         let missing = std::env::temp_dir().join("audio-stack-overview-does-not-exist.wav");
-        let result = read(&Location::File(missing), runtime().handle(), &mut |_| {
-            ControlFlow::Continue(())
-        });
+        let result = read(
+            &Location::File(missing),
+            None,
+            runtime().handle(),
+            &mut |_| ControlFlow::Continue(()),
+        );
         assert!(result.is_err());
     }
 }
