@@ -81,8 +81,8 @@ fn every_actual_open_resolves_again_and_seeks_the_new_native_source() {
             3.0,
         );
         let mut opened = receive(&task).expect("the freshly resolved file opens");
-        assert!((opened.position_seconds - 3.0).abs() < 0.001);
-        assert!((opened.decoder.position_secs() - opened.position_seconds).abs() < 0.001);
+        assert!((opened.position_secs - 3.0).abs() < 0.001);
+        assert!((opened.decoder.position_secs() - opened.position_secs).abs() < 0.001);
         let mut audio = [0.0; 128];
         assert!(opened.decoder.read(&mut audio).unwrap() > 0);
         assert!(
@@ -316,7 +316,7 @@ fn local_files_keep_their_native_open_and_background_seek_behavior() {
     drop(decoder);
     let task = open_in_background(location, None, runtime().handle().clone(), 3.0);
     let mut opened = receive(&task).unwrap();
-    assert!((opened.position_seconds - 3.0).abs() < 0.001);
+    assert!((opened.position_secs - 3.0).abs() < 0.001);
     let mut audio = [0.0; 128];
     assert!(opened.decoder.read(&mut audio).unwrap() > 0);
     assert!(audio[0] > 0.6);

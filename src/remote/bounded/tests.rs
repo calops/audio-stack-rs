@@ -465,7 +465,7 @@ fn native_decoder_and_background_preload_use_bounded_requests() {
             Err(error) => panic!("the opener disconnected: {error}"),
         }
     };
-    assert!((opened.position_seconds - 3.0).abs() < 0.001);
+    assert!((opened.position_secs - 3.0).abs() < 0.001);
     let decoder = &mut opened.decoder;
     let duration = decoder.format().duration_secs.unwrap();
     assert!((duration - 4.0).abs() < 0.01);

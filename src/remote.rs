@@ -332,7 +332,7 @@ mod tests {
                 Err(error) => panic!("the opener disconnected: {error}"),
             }
         };
-        assert!((opened.position_seconds - 0.5).abs() < 0.001);
+        assert!((opened.position_secs - 0.5).abs() < 0.001);
         let mut audio = [0.0; 128];
         assert!(opened.decoder.read(&mut audio).unwrap() > 0);
         assert!(audio[0] > 0.4);

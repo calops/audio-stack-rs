@@ -184,7 +184,7 @@ Failed speculative preloads wait for the normal foreground open rather than
 spinning on repeated resolution.
 
 The host owns authentication, URL caching, and expiration decisions. To replace
-an expired source, call `engine.refresh_current(position_seconds, playing)`.
+an expired source, call `engine.refresh_current(position_secs, playing)`.
 The engine resolves and seeks on a worker before replacing the decoder, keeping
 the queue order and current track identity. `playing` chooses the final
 play/pause state; refresh does not introduce expiration timers or status retries.

@@ -136,9 +136,9 @@ impl AudioEngine {
     /// Reopens the current queued source and seeks before installing it.
     /// Preserves queue order and track identity; `playing` selects the state
     /// after opening. The host decides when a source needs refreshing.
-    pub fn refresh_current(&self, position_seconds: f64, playing: bool) {
+    pub fn refresh_current(&self, position_secs: f64, playing: bool) {
         let _ = self.send(EngineCommand::RefreshCurrent {
-            position_seconds,
+            position_secs,
             playing,
         });
     }
