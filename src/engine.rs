@@ -615,14 +615,18 @@ impl Engine {
             } => self.set_loop(start_secs, end_secs, repeats),
             EngineCommand::ClearLoop => self.clear_loop(),
             EngineCommand::SetShuffle(enabled) => {
-                self.cancel_transition();
+                // A crossfade in progress keeps going: its incoming track is
+                // already the cursor, and the order is rebuilt around it. Only
+                // the preload, opened for the old successor, goes stale.
                 self.clear_preload();
                 self.queue.set_shuffle(enabled);
                 self.refresh_preload();
                 self.emit_state();
             }
             EngineCommand::SetRepeat(enabled) => {
-                self.cancel_transition();
+                // A crossfade in progress keeps going: its incoming track is
+                // already the cursor, and the order is rebuilt around it. Only
+                // the preload, opened for the old successor, goes stale.
                 self.clear_preload();
                 self.queue.set_repeat(enabled);
                 self.refresh_preload();
@@ -4073,6 +4077,42 @@ mod tests {
         // was already heading to, now reached by an ordinary flushed join.
         assert_eq!(engine.queue.index(), 1);
         assert!(engine.decoder.is_some());
+    }
+
+    #[test]
+    fn toggling_shuffle_or_repeat_mid_crossfade_lets_the_fade_finish() {
+        for command in [
+            EngineCommand::SetShuffle(true),
+            EngineCommand::SetRepeat(true),
+        ] {
+            let (mut engine, _consumer, path0, path1) =
+                crossfading_engine("audio-stack-crossfade-queue-mode-test");
+            engine.pump();
+            assert!(engine.transition.is_some(), "precondition: fading");
+            let elapsed = engine.transition.as_ref().unwrap().elapsed_frames;
+
+            engine.handle(command);
+
+            assert!(
+                engine.transition.is_some(),
+                "a queue-mode toggle must not cut the incoming track off"
+            );
+            assert_eq!(engine.queue.index(), 1, "the incoming track stays current");
+            for _ in 0..500 {
+                engine.pump();
+                if engine.transition.is_none() {
+                    break;
+                }
+            }
+            let _ = std::fs::remove_file(&path0);
+            let _ = std::fs::remove_file(&path1);
+            assert!(engine.transition.is_none(), "the original fade completes");
+            assert_eq!(engine.queue.index(), 1);
+            assert!(
+                engine.boundaries.iter().any(|boundary| boundary.index == 1),
+                "the incoming track took over without restarting (elapsed {elapsed})"
+            );
+        }
     }
 
     #[test]
